@@ -12,7 +12,7 @@ import models
 
 # --- Configuration ---
 BATCH_SIZE = 128
-EPOCHS = 10  # Adjust as needed (e.g., 50-100 for better convergence)
+EPOCHS = 50  # Adjust as needed (e.g., 50-100 for better convergence)
 LEARNING_RATE = 0.001
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DATA_ROOT = './data'
@@ -64,7 +64,7 @@ def get_cifar_loaders():
 def get_tinyimagenet_loaders():
     # TinyImageNet is not built-in. Assumes structure: ./data/tiny-imagenet-200/train and /val
     # Images are 64x64
-    tiny_root = os.path.join(DATA_ROOT, 'images')
+    tiny_root = os.path.join(DATA_ROOT, 'tiny-imagenet-200')
     
     if not os.path.exists(tiny_root):
         print(f"\n[WARNING] TinyImageNet dataset not found at {tiny_root}.")
@@ -197,9 +197,9 @@ if __name__ == "__main__":
     
     # 2. CIFAR-10 Models
     # Note: These functions default to in_dim=32, which matches CIFAR
-    train_model(models.cnn_4layer_stride1_padding0, 'CIFAR', 'cnn_4layer_stride1_padding0')
-    train_model(models.cnn_4layer_stride1_padding0_demo, 'CIFAR', 'cnn_4layer_stride1_padding0_demo')
-    train_model(models.cnn_6layer_stride1_padding0, 'CIFAR', 'cnn_6layer_stride1_padding0')
+    # train_model(models.cnn_4layer_stride1_padding0, 'CIFAR', 'cnn_4layer_stride1_padding0')
+    # train_model(models.cnn_4layer_stride1_padding0_demo, 'CIFAR', 'cnn_4layer_stride1_padding0_demo')
+    # train_model(models.cnn_6layer_stride1_padding0, 'CIFAR', 'cnn_6layer_stride1_padding0')
     
     # 3. TinyImageNet Models
     # Note: TinyImageNet is 64x64. We pass in_dim=64 to ensure Linear layers are sized correctly.

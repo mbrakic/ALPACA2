@@ -17,7 +17,7 @@ import models
 
 # Note: Assuming these imports exist in your environment
 from ALPACA.ALPACA import ALPACA
-from InformedSampling3 import LangevinSampler, RandomSampler
+from InformedSampling import LangevinSampler, RandomSampler
 
 from lipMIP.lipMIP import LipMIP
 from lipMIP.hyperbox import Hyperbox 
@@ -28,6 +28,8 @@ from auto_LiRPA import BoundedModule, BoundedTensor
 from auto_LiRPA.perturbations import PerturbationLpNorm
 from auto_LiRPA.jacobian import JacobianOP, GradNorm
 from bab_runner import lirpa_local_lipschitz, compute_margin_jacobian_bound
+
+from EClipsE.LipConstEstimator import LipConstEstimator
 
 
 def create_network(net_dimensions):
@@ -345,77 +347,50 @@ def run_lipmip_analysis(config_args, timeout=None):
         print(f"LipMIP Computation Failed: {e}")
         return None
 
-"""
-if __name__ == "__main__":
+def run_eclipse_analysis(config_args, eclipseMethod='ECLipsE_Fast'):
 
-    # --- CONFIGURATION ---
-    FOLDER_NAME = 'MNIST'
-    MODEL_NAME = 'mnist_cnn_4layer' # Options: 'mnist_cnn_4layer', 'mnist_mlp_3layer', 'mnist_cnn_4layer_8'
-    WEIGHTS_FILENAME = f'{MODEL_NAME}.pth'
-    WEIGHT_NORMALISATION = ((0.1307,), (0.3081,)), 
-    IMAGE_FILENAME = 'test_image_mnist.png' 
-    NETWORK_DIMENSIONS = [4,8,16,2] # for example
-    EPSILON = 3/255  # The size of the attack box
-    GPU_ID = 0 
-    DEVICE = torch.device(f"cuda:{GPU_ID}" if torch.cuda.is_available() else "cpu")
+    model, x0, c_vector, pred_name = setup_model_and_image(config_args)
 
-    config_args = {
-        "FOLDER_NAME": FOLDER_NAME,
-        "MODEL_NAME": MODEL_NAME,
-        "WEIGHTS_FILENAME": WEIGHTS_FILENAME,
-        "WEIGHT_NORMALISATION": WEIGHT_NORMALISATION,
-        "IMAGE_FILENAME": IMAGE_FILENAME,
-        "NETWORK_DIMENSIONS": NETWORK_DIMENSIONS,
-        "EPSILON": EPSILON,
-        "GPU_ID": GPU_ID,
-        "DEVICE": DEVICE
-    }
+    print(f'\n--- Starting ECLipsE analysis ({eclipseMethod}) ---')
+    
+    class EclipseModel(nn.Module):
+        def __init__(self, model, c_vector):
+            super().__init__()
+            
+            # Fix 1: Correctly calculate in_features
+            # c_vector shape is [1, 200]. We need 200.
+            in_features = c_vector.shape[1]
+            
+            difference_layer = nn.Linear(in_features=in_features, out_features=1, bias=False)
+            
+            with torch.no_grad():
+                difference_layer.weight.copy_(c_vector)
+            difference_layer.weight.requires_grad = False
 
-    # SAMPLING PARAMETERS
-    STEPS = 1024      # Steps for Adam
-    WALKERS = 128     # Number of parallel restart points
-    STEP_SIZE = 0.05 * EPSILON
-    TEMP = 1e-4
-    BATCH_SIZE = 64
+            # --- FIX START: Handle both raw Sequential and ReLUNet wrappers ---
+            if hasattr(model, 'net'):
+                # It is a ReLUNet wrapper
+                layers = list(model.net.children())
+            else:
+                # It is a raw nn.Sequential or nn.Module
+                layers = list(model.children())
+            # --- FIX END ---
+                
+            new_layers = layers + [difference_layer]
+            self.features = nn.Sequential(*new_layers)
 
-    sampling_args = {
-        "STEPS": STEPS,
-        "WALKERS": WALKERS,
-        "TEMP": TEMP,
-        "STEP_SIZE": 0.05 * EPSILON, # Dynamically calculated
-        "BATCH_SIZE": BATCH_SIZE
-    }
+        def forward(self,x):
+            return self.features(x)
 
-    # ALPACA PARAMETERS
-    GAMMA = 0.001 
+    # Move to CPU for analysis
+    ec_model = EclipseModel(model.to('cpu'), c_vector.to('cpu'))
 
-    alpaca_args = {
-        "GAMMA": GAMMA
-    }
-
-    print(f"Running on device: {DEVICE}")
-
-    st = time.time() 
-    mipres = run_lipmip_analysis(config_args)
-    mip_time = time.time() - st
-
-    st = time.time() 
-    lirpa_res = run_lirpa_analysis(config_args)
-    lirpa_time = time.time() - st
-
-    st = time.time() 
-    acc_inputs, acc_norms = run_lipschitz_sampling(config_args, sampling_args)
-    sample_time = time.time() - st 
-
-    st = time.time() 
-    alpacares = run_alpaca(alpaca_args, acc_inputs, acc_norms) 
-    alpaca_time = time.time() - st 
-
-    print('lirpa result:', lirpa_res, 'lirpa_time:', lirpa_time)
-    print('lipmip result:', mipres, 'miptime:', mip_time)
-    print('alpaca result:', alpacares['Est_Endpoint'].iloc[0], 'alpaca_time:',
-    alpaca_time)
-"""
+    LCE = LipConstEstimator(ec_model)
+    LCE.model_review()
+    
+    result = LCE.estimate(eclipseMethod)
+    print("--- ECLipsE analysis complete ---")
+    return result
 
 if __name__ == "__main__":
     

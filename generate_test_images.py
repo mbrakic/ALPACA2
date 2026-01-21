@@ -7,13 +7,29 @@ from PIL import Image
 # --- Configuration ---
 DATA_ROOT = './data'
 SAVE_DIRS = {
-    'MNIST':        './MNIST_Models',
-    'CIFAR':        './CIFAR_Models',
-    'TinyImageNet': './TinyImageNet_Models'
+    'MNIST':        './MNIST',
+    'CIFAR':        './CIFAR',
+    'TinyImageNet': './TinyImageNet'
+}
+
+# Standard Normalization Stats (Mean, Std)
+# Using standard pre-computed values for these datasets
+DATASET_STATS = {
+    'MNIST': (
+        (0.1307,), 
+        (0.3081,)
+    ),
+    'CIFAR': (
+        (0.4914, 0.4822, 0.4465), 
+        (0.2023, 0.1994, 0.2010)
+    ),
+    'TinyImageNet': (
+        (0.485, 0.456, 0.406), 
+        (0.229, 0.224, 0.225)
+    )
 }
 
 # Image dimensions for verification/generation
-# (Though we will pull from actual datasets to be useful)
 DIMENSIONS = {
     'MNIST': (1, 28, 28),
     'CIFAR': (3, 32, 32),
@@ -23,15 +39,12 @@ DIMENSIONS = {
 def get_test_dataset(name):
     """Returns the raw test dataset (PIL images if possible, or tensors)."""
     if name == 'MNIST':
-        # MNIST raw is PIL
         return torchvision.datasets.MNIST(root=DATA_ROOT, train=False, download=True)
     
     elif name == 'CIFAR':
-        # CIFAR100 raw is PIL
-        return torchvision.datasets.CIFAR100(root=DATA_ROOT, train=False, download=True)
+        return torchvision.datasets.CIFAR10(root=DATA_ROOT, train=False, download=True)
     
     elif name == 'TinyImageNet':
-        # TinyImageNet requires the val folder we set up previously
         tiny_root = os.path.join(DATA_ROOT, 'tiny-imagenet-200', 'val')
         if not os.path.exists(tiny_root):
             print("[!] TinyImageNet val folder not found. Generating Random Noise images instead.")
@@ -47,6 +60,17 @@ def save_images_and_build_dict(num_images=10):
         print(f"--- Processing {dataset_name} ---")
         os.makedirs(save_dir, exist_ok=True)
         
+        # --- NEW CODE: Save Normalization Stats ---
+        if dataset_name in DATASET_STATS:
+            stats = DATASET_STATS[dataset_name]
+            # Construct filename: e.g., 'mnist_stat.pt'
+            stat_filename = f"{dataset_name.lower()}_stat.pt"
+            stat_path = os.path.join(save_dir, stat_filename)
+            
+            torch.save(stats, stat_path)
+            print(f"    Saved stats to {stat_filename} {stats}")
+        # ------------------------------------------
+
         # Initialize sub-dict for this dataset
         test_suite_dictionary[dataset_name] = {}
         
@@ -69,15 +93,13 @@ def save_images_and_build_dict(num_images=10):
                 
                 img.save(save_path)
             else:
-                # Fallback: Generate random noise if dataset missing (e.g. TinyImageNet not downloaded)
+                # Fallback: Generate random noise if dataset missing
                 c, h, w = DIMENSIONS[dataset_name]
-                # Create random tensor and save as image
                 rand_tensor = torch.rand(c, h, w)
                 img = transforms.ToPILImage()(rand_tensor)
                 img.save(save_path)
 
             # Update Dictionary
-            # We store the filename. The analysis script knows the folder path.
             test_suite_dictionary[dataset_name][img_key] = img_filename
             
             print(f"    Saved {img_filename}")
@@ -85,13 +107,13 @@ def save_images_and_build_dict(num_images=10):
     return test_suite_dictionary
 
 if __name__ == "__main__":
-    # 1. Generate Images
+    # 1. Generate Images and Save Stats
     full_dict = save_images_and_build_dict(10)
     
     # 2. Save the Dictionary itself
-    dict_path = 'test_suite_dictionary.pt'
+    dict_path = 'test_suite_dictionary_cnn.pt'
     torch.save(full_dict, dict_path)
     
     print(f"\n[Success] Test suite dictionary saved to {dict_path}")
     print("Structure Preview:")
-    print(full_dict['MNIST']['image_0']) # Should print 'test_image_0.png'
+    print(full_dict['MNIST']['image_0'])

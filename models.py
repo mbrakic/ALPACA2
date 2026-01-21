@@ -28,6 +28,7 @@ def mnist_cnn_4layer(in_ch=1, in_dim=1,width=16):
 
 def mnist_cnn_4layer_8(in_ch=1, in_dim=1, width=16):
     return nn.Sequential(
+        nn.Flatten(),
         nn.Linear(in_features=784, out_features=5000, bias=True),
         nn.ReLU(),
         nn.Linear(in_features=5000, out_features=3872, bias=True),
@@ -70,7 +71,7 @@ def cnn_6layer_stride1_padding0(in_ch=3, in_dim=32, width=32, linear_size=256):
     )
     return model
 
-def cnn_4layer_stride2_imagenet(in_ch=3, in_dim=32, width=32, linear_size=256):
+def cnn_4layer_stride2_imagenet(in_ch=3, in_dim=64, width=32, linear_size=256):
     model = nn.Sequential(
         nn.Conv2d(in_ch, width, 3, stride=2, padding=1),
         nn.ReLU(),

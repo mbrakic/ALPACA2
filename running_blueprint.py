@@ -17,7 +17,7 @@ import models
 
 # Note: Assuming these imports exist in your environment
 from ALPACA.ALPACA import ALPACA
-from InformedSampling3 import LangevinSampler, RandomSampler
+from InformedSampling import LangevinSampler, RandomSampler
 
 from lipMIP.lipMIP import LipMIP
 from lipMIP.hyperbox import Hyperbox 

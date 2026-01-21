@@ -17,7 +17,7 @@ import models
 
 # Note: Assuming these imports exist in your environment
 from ALPACA.ALPACA import ALPACA
-from InformedSampling3 import LangevinSampler, RandomSampler
+from InformedSampling import LangevinSampler, RandomSampler
 
 from lipMIP.lipMIP import LipMIP
 from lipMIP.hyperbox import Hyperbox 
@@ -29,6 +29,33 @@ from auto_LiRPA.perturbations import PerturbationLpNorm
 from auto_LiRPA.jacobian import JacobianOP, GradNorm
 from bab_runner import lirpa_local_lipschitz, compute_margin_jacobian_bound
 
+# imports for eclipse
+from EClipsE.LipConstEstimator import LipConstEstimator
+
+
+def get_model_function_name(dataset, key):
+    # This dictionary maps your "Keys" to the actual function names in models.py
+    model_zoo = {
+        'MNIST': {
+            'CNN_4Layer':   'mnist_cnn_4layer',
+            'CNN_4Layer_8': 'mnist_cnn_4layer_8',
+            'MLP_3Layer':   'mnist_mlp_3layer'
+        },
+        'CIFAR': {
+            'CNN_4Layer':   'cnn_4layer_stride1_padding0',
+            'CNN_6Layer':   'cnn_6layer_stride1_padding0',
+            # 'CNN_4Layer_Demo': 'cnn_4layer_stride1_padding0_demo' 
+        },
+        'TinyImageNet': {
+            'CNN_4Layer':   'cnn_4layer_stride2_imagenet',
+            'CNN_6Layer':   'cnn_6layer_stride2_imagenet'
+        }
+    }
+    
+    try:
+        return model_zoo[dataset][key]
+    except KeyError:
+        raise ValueError(f"Model key '{key}' not found for dataset '{dataset}'.")
 
 def setup_model_and_image(config_args):
     current_dir = os.getcwd()
@@ -37,26 +64,28 @@ def setup_model_and_image(config_args):
     image_path = os.path.join(save_dir, config_args['IMAGE_FILENAME'])
     stats = config_args['WEIGHT_NORMALISATION']
     
-
-    # 1. Instantiate Model using models.py
     print(f"Initializing {config_args['MODEL_NAME']} from models.py...")
-    if config_args['MODEL_NAME'] == 'cnn_4layer_stride1_padding0':
-        network = models.cnn_4layer_stride1_padding0()
-    elif config_args['MODEL_NAME'] == 'cnn_4layer_stride1_padding0_demo':
-        network = models.cnn_4layer_stride1_padding0_demo()
-    elif config_args['MODEL_NAME'] == 'cnn_6layer_stride1_padding0':
-        network = models.cnn_6layer_stride1_padding0()
-    else:
-        raise ValueError(f"Unknown model name: {config_args['MODEL_NAME']}")
+    
+    # 1. Get the internal function name (e.g., "cnn_4layer_stride1_padding0")
+    # using the dataset (FOLDER_NAME) and the key (MODEL_NAME)
+    internal_func_name = get_model_function_name(config_args['FOLDER_NAME'], config_args['MODEL_NAME'])
 
-    # 2. Load Weights
+    # 2. Dynamically get the function from the 'models' module and call it
+    try:
+        model_builder = getattr(models, internal_func_name) # Get the function object
+        network = model_builder()                           # Execute it ()
+    except AttributeError:
+        raise AttributeError(f"Function '{internal_func_name}' not found in models.py")
+    # --- NEW LOGIC END ---
+
+    # 3. Load Weights (Standard code follows...)
     print(f"Loading weights from {weights_path}...")
     if not os.path.exists(weights_path):
-        raise FileNotFoundError(f"Weights not found at {weights_path}. Run train_all_models.py first.")
+        raise FileNotFoundError(f"Weights not found at {weights_path}.")
         
     state_dict = torch.load(weights_path, map_location=config_args['DEVICE'])
-    network.load_state_dict(state_dict)
-    
+    network.load_state_dict(state_dict)   
+
     # Wrap in Normalization
     model = network.to(config_args['DEVICE'])
     model.eval()
@@ -346,96 +375,100 @@ def run_lipmip_analysis(config_args, timeout=None):
         print(f"LipMIP Computation Failed: {e}")
         return None
 
-"""
-if __name__ == "__main__":
+def run_eclipse_analysis(config_args, eclipseMethod='ECLipsE_Fast'):
 
-    # --- CONFIGURATION ---
-    FOLDER_NAME = 'MNIST'
-    MODEL_NAME = 'mnist_cnn_4layer' # Options: 'mnist_cnn_4layer', 'mnist_mlp_3layer', 'mnist_cnn_4layer_8'
-    WEIGHTS_FILENAME = f'{MODEL_NAME}.pth'
-    WEIGHT_NORMALISATION = ((0.1307,), (0.3081,)), 
-    IMAGE_FILENAME = 'test_image_mnist.png' 
-    NETWORK_DIMENSIONS = [4,8,16,2] # for example
-    EPSILON = 3/255  # The size of the attack box
-    GPU_ID = 0 
-    DEVICE = torch.device(f"cuda:{GPU_ID}" if torch.cuda.is_available() else "cpu")
+    model, x0, c_vector, pred_name = setup_model_and_image(config_args)
 
-    config_args = {
-        "FOLDER_NAME": FOLDER_NAME,
-        "MODEL_NAME": MODEL_NAME,
-        "WEIGHTS_FILENAME": WEIGHTS_FILENAME,
-        "WEIGHT_NORMALISATION": WEIGHT_NORMALISATION,
-        "IMAGE_FILENAME": IMAGE_FILENAME,
-        "NETWORK_DIMENSIONS": NETWORK_DIMENSIONS,
-        "EPSILON": EPSILON,
-        "GPU_ID": GPU_ID,
-        "DEVICE": DEVICE
-    }
+    print(f'\n--- Starting ECLipsE analysis ({eclipseMethod}) ---')
+    
+    class EclipseModel(nn.Module):
+        def __init__(self, model, c_vector):
+            super().__init__()
+            
+            # Fix 1: Correctly calculate in_features
+            # c_vector shape is [1, 200]. We need 200.
+            in_features = c_vector.shape[1]
+            
+            difference_layer = nn.Linear(in_features=in_features, out_features=1, bias=False)
+            
+            with torch.no_grad():
+                difference_layer.weight.copy_(c_vector)
+            difference_layer.weight.requires_grad = False
 
-    # SAMPLING PARAMETERS
-    STEPS = 1024      # Steps for Adam
-    WALKERS = 128     # Number of parallel restart points
-    STEP_SIZE = 0.05 * EPSILON
-    TEMP = 1e-4
-    BATCH_SIZE = 64
+            # --- FIX START: Handle both raw Sequential and ReLUNet wrappers ---
+            if hasattr(model, 'net'):
+                # It is a ReLUNet wrapper
+                layers = list(model.net.children())
+            else:
+                # It is a raw nn.Sequential or nn.Module
+                layers = list(model.children())
+            # --- FIX END ---
+                
+            new_layers = layers + [difference_layer]
+            self.features = nn.Sequential(*new_layers)
 
-    sampling_args = {
-        "STEPS": STEPS,
-        "WALKERS": WALKERS,
-        "TEMP": TEMP,
-        "STEP_SIZE": 0.05 * EPSILON, # Dynamically calculated
-        "BATCH_SIZE": BATCH_SIZE
-    }
+        def forward(self,x):
+            return self.features(x)
 
-    # ALPACA PARAMETERS
-    GAMMA = 0.001 
+    # Move to CPU for analysis
+    ec_model = EclipseModel(model.to('cpu'), c_vector.to('cpu'))
 
-    alpaca_args = {
-        "GAMMA": GAMMA
-    }
+    LCE = LipConstEstimator(ec_model)
+    LCE.model_review()
+    
+    result = LCE.estimate(eclipseMethod)
+    print("--- ECLipsE analysis complete ---")
+    return result
 
-    print(f"Running on device: {DEVICE}")
-
-    st = time.time() 
-    mipres = run_lipmip_analysis(config_args)
-    mip_time = time.time() - st
-
-    st = time.time() 
-    lirpa_res = run_lirpa_analysis(config_args)
-    lirpa_time = time.time() - st
-
-    st = time.time() 
-    acc_inputs, acc_norms = run_lipschitz_sampling(config_args, sampling_args)
-    sample_time = time.time() - st 
-
-    st = time.time() 
-    alpacares = run_alpaca(alpaca_args, acc_inputs, acc_norms) 
-    alpaca_time = time.time() - st 
-
-    print('lirpa result:', lirpa_res, 'lirpa_time:', lirpa_time)
-    print('lipmip result:', mipres, 'miptime:', mip_time)
-    print('alpaca result:', alpacares['Est_Endpoint'].iloc[0], 'alpaca_time:',
-    alpaca_time)
-"""
 
 if __name__ == "__main__":
     
+    # # --- CONFIGURATION ---
+    # FOLDER_NAME = 'CIFAR'
+    # MODEL_NAME = 'cnn_4layer_stride1_padding0' # Options: 'mnist_cnn_4layer', 'mnist_mlp_3layer', 'mnist_cnn_4layer_8'
+    # WEIGHTS_FILENAME = f'{MODEL_NAME}.pth'
+    # IMAGE_FILENAME = 'test_image_cifar.png' 
+
+    # 1. Directory Map
+    DIR_MAP = {
+        'MNIST':        'MNIST',
+        'CIFAR':        'CIFAR',
+        'TinyImageNet': 'TinyImageNet'
+    }
+
+    # 2. Statistics Files (Normalization constants)
+    STAT_FILES = {
+        'MNIST':        'mnist_stat.pt',
+        'CIFAR':        'cifar10_stat.pt',
+        'TinyImageNet': 'tinyimagenet_stat.pt'
+    }
+
     # --- CONFIGURATION ---
-    FOLDER_NAME = 'CIFAR'
-    MODEL_NAME = 'cnn_4layer_stride1_padding0' # Options: 'mnist_cnn_4layer', 'mnist_mlp_3layer', 'mnist_cnn_4layer_8'
-    WEIGHTS_FILENAME = f'{MODEL_NAME}.pth'
-    IMAGE_FILENAME = 'test_image_cifar.png' 
+    FOLDER_NAME = 'TinyImageNet'
     
-    # MNIST Stats (Mean, Std)
-    WEIGHT_NORMALISATION = ((0.1307,), (0.3081,))
+    # NOW YOU CAN USE THE SIMPLE KEY:
+    MODEL_KEY = 'CNN_4Layer' 
+    
+    # Note: Ensure your weights filename logic matches how you saved them. 
+    # If your files are named "cnn_4layer_stride1_padding0.pth", you might need to resolve the name here too.
+    internal_name = get_model_function_name(FOLDER_NAME, MODEL_KEY) 
+    WEIGHTS_FILENAME = f'{internal_name}.pth'
+    
+    IMAGE_FILENAME = 'test_image_0.png'
+
+    stat_filename = STAT_FILES[FOLDER_NAME] 
+    stat_path = os.path.join(FOLDER_NAME, stat_filename) 
+    WEIGHT_NORMALISATION = torch.load(stat_path)
     
     GPU_ID = 0
     DEVICE = torch.device(f"cuda:{GPU_ID}" if torch.cuda.is_available() else "cpu")
-    EPSILON = 8/255 
+    # DEVICE = "cpu"
+    # EPSILON = 8/255 
+    EPSILON = 255/255 
 
     config_args = {
         "FOLDER_NAME": FOLDER_NAME,
-        "MODEL_NAME": MODEL_NAME,
+        "MODEL_NAME": MODEL_KEY,
         "WEIGHTS_FILENAME": WEIGHTS_FILENAME,
         "WEIGHT_NORMALISATION": WEIGHT_NORMALISATION,
         "IMAGE_FILENAME": IMAGE_FILENAME,
@@ -445,14 +478,13 @@ if __name__ == "__main__":
     }
 
     # --- 3. PARAMETERS ---
-    STEPS = 4096
+    STEPS = 2*4096
     WALKERS = 128
-    # STEPS = 16
-    # WALKERS = 16
     SOBOL_SAMPLES = 4000
     BATCH_SIZE = 64
-    TEMP = 1e-2
-    NORM = 'linf' 
+    TEMP = 1e-3
+    # NORM = 'linf' 
+    NORM = 'l2' 
 
     sampling_args = {
         "METHOD": 'Langevin', 
@@ -472,13 +504,16 @@ if __name__ == "__main__":
     #     "NORM": NORM
     # }
 
-    GAMMA = 0.01 
+    GAMMA = 0.001 
     alpaca_args = { "GAMMA": GAMMA }
 
     # lirpa_args = {'METHOD': 'alpha-CROWN'}
     lirpa_args = {'METHOD': 'CROWN-IBP'}
 
-    print(f"--- Running Single Test on {MODEL_NAME} ---")
+    eclipseMethod = 'ECLipsE_Fast' 
+    # eclipseMethod = 'ECLipsE' 
+
+    print(f"--- Running Single Test on {MODEL_KEY} ---")
     print(f"Device: {DEVICE}")
 
     # --- 4. EXECUTION ---
@@ -488,23 +523,30 @@ if __name__ == "__main__":
     # mipres = run_lipmip_analysis(config_args, timeout=120)
     # mip_time = time.time() - st
 
-    # B. LiRPA
-    st = time.time() 
-    lirpa_res = run_lirpa_analysis(lirpa_args, config_args)
-    lirpa_time = time.time() - st
+    # # B. LiRPA
+    # st = time.time() 
+    # lirpa_res = run_lirpa_analysis(lirpa_args, config_args)
+    # lirpa_time = time.time() - st
 
-    # C. Sampling
-    st = time.time() 
-    acc_inputs, acc_norms = run_lipschitz_sampling(config_args, sampling_args)
-    print(np.max(acc_norms), np.min(acc_norms))
-    sample_time = time.time() - st 
+    # # C. Sampling
+    # st = time.time() 
+    # acc_inputs, acc_norms = run_lipschitz_sampling(config_args, sampling_args)
+    # print(np.max(acc_norms), np.min(acc_norms))
+    # sample_time = time.time() - st 
 
-    # D. Alpaca
-    st = time.time() 
-    alpacares = run_alpaca(alpaca_args, acc_inputs, acc_norms) 
-    alpaca_time = time.time() - st 
+    # # D. Alpaca
+    # st = time.time() 
+    # alpacares = run_alpaca(alpaca_args, acc_inputs, acc_norms) 
+    # alpaca_time = time.time() - st 
 
-    # print('\n--- Final Results ---')
-    # print(f'LipMIP Result: {mipres:.4f} (Time: {mip_time:.2f}s)')
-    print(f'LiRPA Result: {lirpa_res:.4f} (Time: {lirpa_time:.2f}s)')
-    print(f'Alpaca Result: {alpacares["Est_Endpoint"].iloc[0]:.4f} (Time: {alpaca_time + sample_time:.2f}s)')
+    # D. eclipse
+    st = time.time() 
+    eclipseres = run_eclipse(config_args, eclipseMethod) 
+    eclipse_time = time.time() - st 
+
+    print(eclipseres, eclipse_time)
+
+    # # print('\n--- Final Results ---')
+    # # print(f'LipMIP Result: {mipres:.4f} (Time: {mip_time:.2f}s)')
+    # print(f'LiRPA Result: {lirpa_res:.4f} (Time: {lirpa_time:.2f}s)')
+    # print(f'Alpaca Result: {alpacares["Est_Endpoint"].iloc[0]:.4f} (Time: {alpaca_time + sample_time:.2f}s)')

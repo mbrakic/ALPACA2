@@ -136,6 +136,22 @@ def generate_sobol_in_region(d, n_points, lower_bounds, upper_bounds, shape, see
     lb_flat = lower_bounds.flatten()
     ub_flat = upper_bounds.flatten()
     
+    # --- SAFETY FIX FOR SCIPY QMC ---
+    # Scipy's qmc.scale throws an error if lower_bounds >= upper_bounds.
+    # This happens if pixels are 'stuck' at the very edge of the domain 
+    # (e.g. background pixels that are always 0).
+    # We force a tiny margin to prevent the crash.
+    margin = 1e-6
+    diff = ub_flat - lb_flat
+    
+    # Find dimensions where the box is too thin or inverted
+    problem_mask = diff <= margin
+    
+    if np.any(problem_mask):
+        # Extend the upper bound slightly for these dimensions
+        ub_flat[problem_mask] = lb_flat[problem_mask] + margin
+    # --------------------------------
+    
     # Use Latin Hypercube for High-Dim (ImageNet is ~150k dims)
     if d > 20000:
         sampler = qmc.LatinHypercube(d=d, seed=seed)
@@ -143,7 +159,10 @@ def generate_sobol_in_region(d, n_points, lower_bounds, upper_bounds, shape, see
         sampler = qmc.Sobol(d=d, seed=seed, scramble=scramble)
     
     unit_samples = sampler.random(n=n_points) 
+    
+    # Now this call is safe
     scaled_samples_flat = qmc.scale(unit_samples, lb_flat, ub_flat)
+    
     return scaled_samples_flat.reshape(n_points, *shape)
 
 def get_input_norms(network, c_vector, data_loader, norm_type='linf', desc="Sobol Evaluation"):
@@ -180,18 +199,18 @@ def get_input_norms(network, c_vector, data_loader, norm_type='linf', desc="Sobo
     return all_inputs, grad_norms
 
 
-# --- [MODIFIED] LangevinSampler Class ---
-
 class LangevinSampler:
     """
     Replaces AdamSobolSampler. Uses SGLD to probe the tail, then applies
-    spatial declustering and Sobol refinement.
+    spatial declustering, Sobol refinement, and POT-specific jittering.
     """
     def __init__(self, model, c_vector, domain, device, 
                  norm_type='linf', steps=500, walkers=64, step_size=0.01, 
                  temperature=0.01, # New param for tail width
                  nms_radius=0.1, top_k_refine=20, min_k_diff=1e-4, k_box_epsilon=1e-3, 
-                 sobol_samples_per_k=800, batch_size=32):
+                 sobol_samples_per_k=800, batch_size=32,
+                #  jitter_strategy='silverman', jitter_factor=2*np.pi): # Added jitter params
+                 jitter_strategy='silverman', jitter_factor=4.): # Added jitter params
         
         self.model = model
         self.c_vector = c_vector
@@ -218,9 +237,13 @@ class LangevinSampler:
         self.k_box_epsilon = k_box_epsilon
         self.sobol_samples_per_k = sobol_samples_per_k
         self.batch_size = batch_size
+        
+        # Jitter Configuration
+        self.jitter_strategy = jitter_strategy
+        self.jitter_factor = jitter_factor
 
     def run(self):
-        """Full SGLD + Spatial Decorrelation + Sobol Refinement"""
+        """Full SGLD + Spatial Decorrelation + Sobol Refinement + Jitter"""
         
         # 1. SGLD Sampling (The "Global" Search)
         print(f"\n--- STAGE 1: Running SGLD Global Search ---")
@@ -254,51 +277,136 @@ class LangevinSampler:
         print(f"\n--- STAGE 4: Sobol Refinement (Local Volume Estimation) ---")
         final_inputs, final_norms = self._run_sobol_refinement(top_k_inputs, top_k_norms)
 
-        return final_inputs, final_norms
+        # 5. Jittering (Smoothing for POT)
+        # Apply magnitude-dependent noise to smooth out the tail distribution
+        print(f"\n--- STAGE 5: Applying POT Jitter ({self.jitter_strategy}) ---")
+        final_norms_jittered = self._apply_pot_jitter(final_norms)
 
-    def _spatial_decorrelation(self, inputs: np.ndarray, values: np.ndarray, radius: float):
-        """
-        Filters points that are too close in Euclidean space.
-        """
-        if len(values) == 0: return np.array([]), np.array([])
+        return final_inputs, final_norms_jittered
 
-        flat_inputs = inputs.reshape(inputs.shape[0], -1)
+    def _apply_pot_jitter(self, values: np.ndarray) -> np.ndarray:
+        """
+        Applies scale-dependent jitter (Homoscedastic scaled by Global Magnitude)
+        using Silverman's Rule logic to avoid inflating the tail index.
+        """
+        # Ensure numpy array and flat
+        v = np.array(values).flatten()
+        n = len(v)
         
-        # KDTree is efficient for finding neighbors
+        if n < 2:
+            return v # Cannot determine scale from < 2 points
+
+        # A. Determine Robust Global Scale
+        # Use IQR / 1.34 to estimate sigma without outlier sensitivity
+        q75, q25 = np.percentile(v, [75, 25])
+        iqr_scale = (q75 - q25) / 1.34
+        std_scale = np.std(v)
+        
+        # Use IQR if valid (>0), else fallback to std, else fallback to mean magnitude
+        scale = iqr_scale if iqr_scale > 1e-9 else std_scale
+        if scale == 0: scale = np.abs(np.mean(v)) + 1e-9
+
+        # B. Calculate Noise Sigma
+        if self.jitter_strategy == 'silverman':
+            # Bandwidth rule: Scale * N^(-1/5)
+            # Reduces noise as sample size increases
+            sigma_jitter = self.jitter_factor * scale * (n ** -0.2)
+            
+        elif self.jitter_strategy == 'relative':
+            # Fixed % of the median magnitude
+            central_mag = np.median(np.abs(v))
+            if central_mag == 0: central_mag = np.mean(np.abs(v))
+            sigma_jitter = self.jitter_factor * central_mag
+        else:
+            # Default fallback
+            sigma_jitter = 0.0
+
+        # C. Apply Noise
+        noise = np.random.normal(loc=0.0, scale=sigma_jitter, size=v.shape)
+        jittered_v = v + noise
+        
+        # Logging for sanity check
+        print(f"   > Data Scale (IQR/Std): {scale:.4f}")
+        print(f"   > Jitter Sigma:         {sigma_jitter:.4f}")
+        
+        return jittered_v
+
+    # --- Existing Helper Methods ---
+    
+    def _spatial_decorrelation(self, inputs: np.ndarray, values: np.ndarray, radius: float):
+        if len(values) == 0: return np.array([]), np.array([])
+        flat_inputs = inputs.reshape(inputs.shape[0], -1)
         kdtree = cKDTree(flat_inputs)
         sorted_indices = np.argsort(values)[::-1]
-        
         suppressed = np.zeros(len(values), dtype=bool)
         kept_indices = []
 
         for i in sorted_indices:
             if suppressed[i]: continue
             kept_indices.append(i)
-            # Find all points within radius of this peak and suppress them
             neighbors = kdtree.query_ball_point(flat_inputs[i], r=radius)
             suppressed[neighbors] = True
             
         kept_indices = np.array(kept_indices, dtype=int)
         return inputs[kept_indices], values[kept_indices]
 
-    def _get_diverse_top_k(self, norms, inputs, k, min_diff):
-        """Standard top-k selection"""
-        sorted_indices = np.argsort(norms)[::-1]
-        selected_indices = []
-        last_val = None
+    # def _get_diverse_top_k(self, norms, inputs, k, min_diff):
+    #     sorted_indices = np.argsort(norms)[::-1]
+    #     selected_indices = []
+    #     last_val = None
 
-        for idx in sorted_indices:
-            if len(selected_indices) >= k: break
-            curr_val = norms[idx]
-            if last_val is None or abs(last_val - curr_val) >= min_diff:
-                selected_indices.append(idx)
-                last_val = curr_val
+    #     for idx in sorted_indices:
+    #         if len(selected_indices) >= k: break
+    #         curr_val = norms[idx]
+    #         if last_val is None or abs(last_val - curr_val) >= min_diff:
+    #             selected_indices.append(idx)
+    #             last_val = curr_val
                 
-        final_indices = np.array(selected_indices)
-        return norms[final_indices], inputs[final_indices]
+    #     final_indices = np.array(selected_indices)
+    #     return norms[final_indices], inputs[final_indices]
+
+    def _get_diverse_top_k(self, norms, inputs, k, min_diff):
+            """
+            Adaptive Selection:
+            Tries to find 'k' peaks separated by at least 'min_diff' in value.
+            If not enough are found, it relaxes 'min_diff' iteratively until k are found.
+            """
+            print(np.max(norms), np.min(norms))
+            print(np.unique(norms))
+            current_min_diff = min_diff
+            # Try up to 20 times, halvinug the constraint each time
+            max_attempts = 20 
+            
+            for attempt in range(max_attempts):
+                sorted_indices = np.argsort(norms)[::-1]
+                selected_indices = []
+                last_val = None
+        
+                for idx in sorted_indices:
+                    if len(selected_indices) >= k: 
+                        break
+                    
+                    curr_val = norms[idx]
+                    # Check value diversity against the *current* adaptive threshold
+                    if last_val is None or abs(last_val - curr_val) >= current_min_diff:
+                        selected_indices.append(idx)
+                        last_val = curr_val
+                
+                # If we found enough peaks, or if we've relaxed the constraint to 0, stop.
+                if len(selected_indices) >= k or current_min_diff <= 1e-9:
+                    if attempt > 0:
+                        print(f"   > Adaptive Diversity: Relaxed min_diff to {current_min_diff:.2e} to find {len(selected_indices)} peaks.")
+                    final_indices = np.array(selected_indices)
+                    return norms[final_indices], inputs[final_indices]
+                
+                # If not enough found, relax the constraint for the next loop
+                current_min_diff /= 2.0
+                
+            # Fallback (should theoretically be covered by the loop, but for safety)
+            final_indices = np.array(selected_indices)
+            return norms[final_indices], inputs[final_indices]
 
     def _run_sobol_refinement(self, centers, center_norms):
-        """Local sampling around peaks"""
         final_inputs_list = []
         final_norms_list = []
         
@@ -306,11 +414,9 @@ class LangevinSampler:
         orig_high = self.domain.box_hi.cpu().numpy()
 
         for i, (center, norm_val) in enumerate(zip(centers, center_norms)):
-            # Define small box around the peak
             small_low = np.maximum(center - self.k_box_epsilon, orig_low)
             small_high = np.minimum(center + self.k_box_epsilon, orig_high)
             
-            # Generate Sobol/LHS samples
             sobol_inputs = generate_sobol_in_region(
                 d=self.flat_dim,
                 n_points=self.sobol_samples_per_k,
@@ -320,7 +426,6 @@ class LangevinSampler:
                 seed=int(np.random.rand() * 1000)
             )
             
-            # Evaluate samples
             tensor_inputs = torch.from_numpy(sobol_inputs).float()
             dataset = TensorDataset(tensor_inputs, torch.zeros(len(tensor_inputs), dtype=torch.long))
             loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False)
@@ -330,8 +435,6 @@ class LangevinSampler:
                 norm_type=self.norm_type
             )
             
-            # Combine the center peak with its surrounding samples
-            # This gives you the "Distribution" of the peak, not just the max
             final_inputs_list.append(np.concatenate([center[None, ...], box_inputs], axis=0))
             final_norms_list.append(np.concatenate([np.array([norm_val]), box_norms], axis=0))
             
@@ -339,3 +442,116 @@ class LangevinSampler:
             return np.array([]), np.array([])
 
         return np.concatenate(final_inputs_list, axis=0), np.concatenate(final_norms_list, axis=0)
+
+class RandomSampler:
+    """
+    Baseline Sampler: Performs global Sobol sampling over the domain
+    and applies POT-specific jittering to the resulting gradient norms.
+    """
+    def __init__(self, model, c_vector, domain, device, 
+                 norm_type='linf', num_samples=10000, batch_size=32,
+                 jitter_strategy='silverman', jitter_factor=4.):
+                #  jitter_strategy='silverman', jitter_factor=2*np.pi):
+        
+        self.model = model
+        self.c_vector = c_vector
+        self.domain = domain
+        self.device = device
+        self.norm_type = norm_type
+        self.num_samples = num_samples
+        self.batch_size = batch_size
+        
+        # Jitter Configuration
+        self.jitter_strategy = jitter_strategy
+        self.jitter_factor = jitter_factor
+
+        # Shape handling (matching your existing logic)
+        if domain.box_low.dim() == 4 and domain.box_low.shape[0] == 1:
+            self.input_shape = domain.box_low.shape[1:]
+        else:
+            self.input_shape = domain.box_low.shape
+            
+        self.flat_dim = domain.box_low.numel()
+
+    def run(self):
+        """
+        Executes Sobol sampling -> Norm Evaluation -> Jittering.
+        """
+        print(f"\n--- RandomSampler: Generating {self.num_samples} Sobol samples ---")
+        
+        # 1. Generate Global Sobol Samples
+        # We use a random seed to ensure different runs cover different sub-grids if scrambled
+        seed = int(time.time() % 10000)
+        
+        # Convert domain bounds to numpy
+        low_bound = self.domain.box_low.detach().cpu().numpy()
+        high_bound = self.domain.box_hi.detach().cpu().numpy()
+
+        sobol_inputs = generate_sobol_in_region(
+            d=self.flat_dim,
+            n_points=self.num_samples,
+            lower_bounds=low_bound,
+            upper_bounds=high_bound,
+            shape=self.input_shape,
+            seed=seed
+        )
+
+        # 2. Evaluate Norms
+        # Wrap in DataLoader for batch processing
+        tensor_inputs = torch.from_numpy(sobol_inputs).float()
+        # Create a dummy target tensor just to satisfy TensorDataset
+        dataset = TensorDataset(tensor_inputs, torch.zeros(len(tensor_inputs), dtype=torch.long))
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False)
+
+        print(f"--- RandomSampler: Evaluating Gradients ({self.norm_type}) ---")
+        inputs, norms = get_input_norms(
+            self.model, 
+            self.c_vector, 
+            loader, 
+            norm_type=self.norm_type
+        )
+
+        # 3. Apply Jitter
+        # This smooths the discrete Sobol spikes for better POT fitting
+        print(f"--- RandomSampler: Applying Jitter ({self.jitter_strategy}) ---")
+        jittered_norms = self._apply_pot_jitter(norms)
+
+        return inputs, jittered_norms
+
+    def _apply_pot_jitter(self, values: np.ndarray) -> np.ndarray:
+        """
+        Applies scale-dependent jitter to smooth the distribution.
+        Duplicated from LangevinSampler to ensure standalone functionality.
+        """
+        v = np.array(values).flatten()
+        n = len(v)
+        
+        if n < 2:
+            return v
+
+        # A. Determine Robust Global Scale
+        q75, q25 = np.percentile(v, [75, 25])
+        iqr_scale = (q75 - q25) / 1.34
+        std_scale = np.std(v)
+        
+        scale = iqr_scale if iqr_scale > 1e-9 else std_scale
+        if scale == 0: scale = np.abs(np.mean(v)) + 1e-9
+
+        # B. Calculate Noise Sigma
+        if self.jitter_strategy == 'silverman':
+            # Bandwidth rule: Scale * N^(-1/5)
+            sigma_jitter = self.jitter_factor * scale * (n ** -0.2)
+        elif self.jitter_strategy == 'relative':
+            central_mag = np.median(np.abs(v))
+            if central_mag == 0: central_mag = np.mean(np.abs(v))
+            sigma_jitter = self.jitter_factor * central_mag
+        else:
+            sigma_jitter = 0.0
+
+        # C. Apply Noise
+        noise = np.random.normal(loc=0.0, scale=sigma_jitter, size=v.shape)
+        jittered_v = v + noise
+        
+        print(f"   > Jitter Sigma: {sigma_jitter:.6f}")
+        
+        return jittered_v

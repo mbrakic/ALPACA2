@@ -4,24 +4,28 @@ import os
 import time
 from tqdm import tqdm
 
-from running_blueprint import run_alpaca
+try:
+    from running_blueprint import run_alpaca
+except ImportError:
+    # Fallback if running standalone for testing
+    pass
 
 # --- CONFIGURATION ---
-RESULTS_CSV = 'experiment_results_2.csv'
-FINAL_DB_PATH = 'final_collated_results.csv'
+RESULTS_CSV = 'experiment_results_cnn.csv'
+FINAL_DB_PATH = 'final_collated_results_cnn.csv'
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-GAMMA = 0.001 
+GAMMA = 0.01 
 
 alpaca_args = { "GAMMA": GAMMA }
 
 # Columns to display in the final preview
-# (We will save ALL columns, but this is what we print to console)
 PREVIEW_COLS = [
     'Dataset', 
-    'Model_Size', 
-    'Sampling_Time',          # Original Sampling Time
-    'ALPACA_Compute_Time',    # New Processing Time
-    'Total_Pipeline_Time',    # Sum of both
+    'Model_Name', 
+    'Norm',               # <--- Added
+    'Sampling_Time',      
+    'ALPACA_Compute_Time',
+    'Total_Pipeline_Time', 
     'ALPACA_Success', 
     'ALPACA_Endpoint'
 ]
@@ -35,7 +39,7 @@ def collate_and_save_results(csv_path, output_path):
     # 1. Load Data
     if not os.path.exists(csv_path):
         print(f"[!] Input file {csv_path} not found.")
-        return
+        return pd.DataFrame() # Return empty DF
 
     df = pd.read_csv(csv_path)
     print(f"Loaded {len(df)} rows. Initializing new columns...")
@@ -49,6 +53,15 @@ def collate_and_save_results(csv_path, output_path):
         'Total_Pipeline_Time'
     ]
     
+    # Ensure 'Norm' and 'Eclipse' columns exist if reading an older file
+    # (Though your previous step should have fixed this)
+    if 'Norm' not in df.columns:
+        df['Norm'] = 'linf'
+    if 'Eclipse_Result' not in df.columns:
+        df['Eclipse_Result'] = None
+    if 'Eclipse_Time' not in df.columns:
+        df['Eclipse_Time'] = None
+
     for col in new_cols:
         if col not in df.columns:
             df[col] = None
@@ -58,7 +71,8 @@ def collate_and_save_results(csv_path, output_path):
     mask = (
         (df['Sampling_File_Path'].notna()) & 
         (df['Sampling_File_Path'] != 'ERROR') & 
-        (df['Sampling_File_Path'] != 'TIMEOUT')
+        (df['Sampling_File_Path'] != 'TIMEOUT') &
+        (df['Sampling_File_Path'] != 'SKIPPED')
     )
     valid_rows = df[mask]
     print(f"Found {len(valid_rows)} valid sampling files to process.")
@@ -99,7 +113,7 @@ def collate_and_save_results(csv_path, output_path):
             # E. Calculate Total Pipeline Time (Sampling + ALPACA)
             # Ensure Sampling_Time is a number, treat NaN as 0 for summation if needed
             sampling_time = row.get('Sampling_Time', 0)
-            if pd.isna(sampling_time): sampling_time = 0
+            if pd.isna(sampling_time) or sampling_time == 'SKIPPED': sampling_time = 0
             
             df.at[idx, 'Total_Pipeline_Time'] = float(sampling_time) + compute_duration
 
@@ -123,19 +137,30 @@ if __name__ == "__main__":
     # Run the collation logic
     final_df = collate_and_save_results(RESULTS_CSV, FINAL_DB_PATH)
 
-    final_df = pd.read_csv(FINAL_DB_PATH)
+    # Reload to ensure clean types
+    if os.path.exists(FINAL_DB_PATH):
+        final_df = pd.read_csv(FINAL_DB_PATH)
 
-    selected_columns = [
-        'Dataset', 'Model_Size', 'LipMIP_Result', 'LipMIP_Time', 'LiRPA_Result',
-        'LiRPA_Time', 'ALPACA_Endpoint', 'Total_Pipeline_Time'
-    ]
+        # --- UPDATED SELECTION COLUMNS ---
+        # Added 'Norm', 'Eclipse_Result', 'Eclipse_Time'
+        selected_columns = [
+            'Dataset', 
+            'Model_Name', 
+            'Norm',                # Important for context
+            'LipMIP_Result', 
+            #'LipMIP_Time',       # Optional: Comment out to save space
+            'LiRPA_Result', 
+            #'LiRPA_Time',        # Optional: Comment out to save space
+            'Eclipse_Result',      # L2 Ground Truth (if run)
+            'Eclipse_Time',
+            'ALPACA_Endpoint',     # Sampling Result
+            'Total_Pipeline_Time'
+        ]
 
-    rel_df = final_df[selected_columns]
-    print(rel_df)
+        # Filter to only show columns that actually exist in the CSV
+        valid_cols = [c for c in selected_columns if c in final_df.columns]
 
-    # # Print Preview
-    # if final_df is not None:
-    #     print("\n--- COLLATED RESULTS PREVIEW ---")
-    #     # Filter strictly for columns that exist to prevent KeyErrors
-    #     valid_preview_cols = [c for c in PREVIEW_COLS if c in final_df.columns]
-    #     print(final_df[valid_preview_cols].head(10))
+        print("\n=== FINAL REPORT ===")
+        print(final_df[valid_cols])
+    else:
+        print("No results file generated.")
